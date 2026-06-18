@@ -223,7 +223,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 mxfp_weight_quant_type=torch_npu.float4_e2m1fn_x2,
                 mxfp_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 mxfp_per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-                mxfp_use_bf16=(x.dtype == torch.bfloat16),
+                mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 swiglu_limit=layer.swiglu_limit,
