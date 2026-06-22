@@ -37,6 +37,20 @@ from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch
 
 
+def _maybe_quantize(hidden_states: torch.Tensor, quant_type: QuantType) -> tuple[torch.Tensor, torch.Tensor | None]:
+    pertoken_scale = None
+    if quant_type == QuantType.W8A8:
+        hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+    elif quant_type in [QuantType.MXFP8, QuantType.W4A8MXFP]:
+        hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=torch.float8_e4m3fn)
+    elif quant_type == QuantType.MXFP4:
+        # W4A4MXFP4 and  W4A8MXFP4 with AllGather+EP currently does not pre-quantize
+        # per-token activations in prepare. Keep quantization in the MoE MLP path.
+        pass
+
+    return hidden_states, pertoken_scale
+
+
 class PrepareAndFinalize(ABC):
     """
     Abstract base class for MoE (Mixture-of-Experts) tensor preparation and finalization
@@ -358,20 +372,12 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if enable_sp() or enable_sp_by_pass():
             return self._prepare_with_ep_group(hidden_states, router_logits, quant_type)
 
-        return self._prepare_with_dp_group(hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce)
+        return self._prepare_with_dp_group(hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce, quant_type)
 
     def _prepare_with_ep_group(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, quant_type=QuantType.NONE
     ) -> MoEPrepareOutput:
-        pertoken_scale = None
-        if quant_type == QuantType.W8A8:
-            hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
-        elif quant_type == QuantType.MXFP8:
-            hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=torch.float8_e4m3fn)
-        elif quant_type in [QuantType.MXFP4, QuantType.W4A8MXFP]:
-            # W4A4MXFP4 and  W4A8MXFP4 with AllGather+EP currently does not pre-quantize
-            # per-token activations in prepare. Keep quantization in the MoE MLP path.
-            pass
+        hidden_states, pertoken_scale = _maybe_quantize(hidden_states, quant_type)
 
         if self.multistream_overlap_gate:
             assert PrepareAndFinalize.quant_stream is not None
@@ -446,10 +452,14 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
+            
+            hidden_states, pertoken_scale = _maybe_quantize(hidden_states, quant_type)
 
             # All-gather across DP group
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
+            if pertoken_scale is not None:
+                pertoken_scale = self.moe_config.dp_group.all_gather(pertoken_scale, 0)
 
         if self.moe_config.pcp_size > 1:
             max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
@@ -459,6 +469,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
+            
+            hidden_states, pertoken_scale = _maybe_quantize(hidden_states, quant_type)
 
             hidden_states = get_pcp_group().all_gather(
                 hidden_states,
@@ -468,13 +480,18 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 router_logits,
                 dim=0,
             )
+            if pertoken_scale is not None:
+                pertoken_scale = get_pcp_group().all_gather(
+                    pertoken_scale,
+                    dim=0,
+                )
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,
             router_logits=router_logits,
             mc2_mask=None,
             padded_hidden_states_shape=None,
-            pertoken_scale=None,
+            pertoken_scale=pertoken_scale,
         )
 
     def all_gather_input_id_with_dp_group(self, input_ids: torch.Tensor) -> torch.Tensor:
