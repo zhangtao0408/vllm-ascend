@@ -433,6 +433,7 @@ def get_kv_cache_coordinator(
     eagle_attn_layer_names: list[str] | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
+    """
     if _is_deepseek_v4_kv_cache_config(kv_cache_config):
         return AscendHybridKVCacheCoordinator(
             kv_cache_config,
@@ -448,6 +449,7 @@ def get_kv_cache_coordinator(
             max_num_batched_tokens=max_num_batched_tokens,
             scheduler_block_size=scheduler_block_size,
         )
+    """
 
     if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
         orig_kwargs = dict(
