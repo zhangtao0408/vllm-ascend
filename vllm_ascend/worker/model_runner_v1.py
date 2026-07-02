@@ -96,6 +96,7 @@ from vllm.v1.worker.cp_utils import (
     get_total_cp_world_size,
 )
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
+from vllm.v1.worker.kv_xfer_debug import build_xfer_debug_cache_views
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     maybe_create_ubatch_slices,
@@ -2313,6 +2314,7 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        self._dump_prefill_kv_xfer_debug(scheduler_output)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -3852,6 +3854,12 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        self._kv_xfer_debug_kv_caches = kv_caches
+        self._kv_xfer_debug_cache_views = (
+            build_xfer_debug_cache_views(kv_caches)
+            if self.kv_xfer_debug_config is not None
+            else ()
+        )
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
