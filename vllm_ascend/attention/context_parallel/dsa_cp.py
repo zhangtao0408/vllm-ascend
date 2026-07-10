@@ -242,6 +242,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
                 for _ in range(spec_token_num)
             ]
+            self.spec_sas_metadata = [
+                torch.zeros(1024, dtype=torch.int32, device=self.device) for _ in range(spec_token_num)
+            ]
             self.decode_threshold += spec_token_num
             assert self.decode_threshold <= 16, (
                 f"decode_threshold exceeded \
@@ -382,6 +385,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # Draft steps update positions independently. Reusing the global RoPE
         # cache can let later draft steps overwrite step-0 metadata.
         cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=False)
+        cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
 
@@ -431,6 +435,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
 
         cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=False)
+        cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
         (
             local_start,
             local_end_with_pad,
@@ -511,6 +516,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             has_ori_kv=True,
             has_cmp_kv=False,
         )
+        self.spec_sas_metadata[draft_index - 1][:1024].copy_(sas_metadata[:1024])
+        sas_metadata = self.spec_sas_metadata[draft_index - 1]
 
         cp_metadata = DSACPMetadata(
             local_query_start_loc=local_query_start_loc,
@@ -1011,6 +1018,19 @@ class AscendDSACPImpl(DSAAttentionImpl):
             self.compressor_wgate = self.compressor.wgate
             self.compressor_norm = self.compressor.norm
             self.compressor_norm_eps = self.compressor.norm_eps
+
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config=None,
+        speculative_config=None,
+        num_dcp_pcp_tokens=None,
+        draft_attn_metadatas=None,
+    ):
+        # dsa does not need to update graph params
+        pass
 
     def _compute_compressor_metadata(
         self,
