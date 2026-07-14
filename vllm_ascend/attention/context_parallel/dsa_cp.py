@@ -224,6 +224,11 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
         self.spec_slot_mapping = None
+        max_cudagraph_capture_size = vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        self.max_num_draft_reqs = max(
+            scheduler_config.max_num_seqs,
+            max_cudagraph_capture_size,
+        )
         if get_ascend_device_type() in {AscendDeviceType.A5}:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens,)  # type: ignore
         else:
@@ -235,11 +240,11 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 for _ in range(spec_token_num)
             ]
             self.spec_local_query_start_loc = [
-                torch.zeros(scheduler_config.max_num_seqs + 1, dtype=torch.int32, device=self.device)
+                torch.zeros(self.max_num_draft_reqs + 1, dtype=torch.int32, device=self.device)
                 for _ in range(spec_token_num)
             ]
             self.spec_local_seq_lens = [
-                torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+                torch.zeros(self.max_num_draft_reqs, dtype=torch.int32, device=self.device)
                 for _ in range(spec_token_num)
             ]
             self.spec_sas_metadata = [
@@ -255,7 +260,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ]
             self.spec_block_tables: list[torch.Tensor | None] = [None] * spec_token_num
             self.spec_start_pos = [
-                torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+                torch.zeros(self.max_num_draft_reqs, dtype=torch.int32, device=self.device)
                 for _ in range(spec_token_num)
             ]
             self.decode_threshold += spec_token_num
@@ -381,6 +386,10 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
+        assert num_reqs <= self.max_num_draft_reqs, (
+            f"Draft request count {num_reqs} exceeds the persistent metadata "
+            f"capacity {self.max_num_draft_reqs}."
+        )
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
@@ -418,7 +427,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         if spec_block_table is None:
             spec_block_table = torch.zeros(
                 (
-                    self.vllm_config.scheduler_config.max_num_seqs,
+                    self.max_num_draft_reqs,
                     common_attn_metadata.block_table_tensor.shape[1],
                 ),
                 dtype=common_attn_metadata.block_table_tensor.dtype,
