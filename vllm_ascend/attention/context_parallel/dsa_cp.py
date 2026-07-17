@@ -355,7 +355,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
 
         req_metadata = self.build_req_metadata(
-            common_attn_metadata, input_positions, input_positions_cpu, num_input_tokens, num_reqs_actual, attn_state
+            common_attn_metadata,
+            input_positions,
+            input_positions_cpu,
+            cos,
+            sin,
+            num_input_tokens,
+            num_reqs_actual,
+            attn_state,
         )
 
         return self.metadata_cls(  # type: ignore
@@ -384,12 +391,10 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSAMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
-        self.common_ratio_to_sas_metadata = kwargs.get("common_ratio_to_sas_metadata", {})
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
         assert num_reqs <= self.max_num_draft_reqs, (
-            f"Draft request count {num_reqs} exceeds the persistent metadata "
-            f"capacity {self.max_num_draft_reqs}."
+            f"Draft request count {num_reqs} exceeds the persistent metadata capacity {self.max_num_draft_reqs}."
         )
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
@@ -441,6 +446,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             draft_index=draft_index,
             common_attn_metadata=common_attn_metadata,
             input_positions=input_positions,
+            cos=cos,
+            sin=sin,
             num_input_tokens=num_input_tokens,
         )
 
@@ -467,6 +474,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         draft_index: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         input_positions: torch.Tensor,
+        cos,
+        sin,
         num_input_tokens: int,
     ) -> AscendDSAReqMetadata:
         """Build DSA-CP metadata for one draft step."""
@@ -476,7 +485,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         seq_lens_q = query_start_loc[1:] - query_start_loc[:-1]
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
 
-        cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
         (
             local_start,
             local_end_with_pad,
@@ -495,7 +503,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             use_cache=False,
             local_query_start_loc=self.spec_local_query_start_loc[draft_index - 1],
             local_seq_lens=self.spec_local_seq_lens[draft_index - 1],
-            draft_index=draft_index,
         )
         _, _, _, _, local_query_start_loc_cpu, local_seq_lens_cpu, _, _ = self._build_local_token_metadata(
             num_reqs=num_reqs,
@@ -504,7 +511,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             query_start_loc=query_start_loc_cpu,
             seq_lens=self.seq_lens_cpu[:num_reqs],
             use_cache=False,
-            draft_index=draft_index,
         )
         local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
         max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
@@ -600,6 +606,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         common_attn_metadata: AscendCommonAttentionMetadata,
         input_positions: torch.Tensor,
         input_positions_cpu: torch.Tensor,
+        cos,
+        sin,
         num_input_tokens: int,
         num_reqs_actual: int | None,
         attn_state: AscendAttentionState,
@@ -612,41 +620,79 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         seq_lens_q = query_start_loc[1:] - query_start_loc[:-1]
 
-        # cos/sin for all tokens
-        cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=not has_prefill)
-
-        (
-            local_start,
-            local_end_with_pad,
-            tokens_per_rank,
-            num_tokens_pad,
-            local_query_start_loc,
-            local_seq_lens,
-            local_cos,
-            local_sin,
-        ) = self._build_local_token_metadata(
-            num_reqs=num_reqs,
-            num_input_tokens=num_input_tokens,
-            input_positions=input_positions,
-            query_start_loc=query_start_loc,
-            seq_lens=self.seq_lens[:num_reqs],
-            use_cache=not has_prefill,
-            local_query_start_loc=self.local_query_start_loc,
-            local_seq_lens=self.local_seq_lens,
+        # This dictionary is shared by compressor-ratio builders for one
+        # metadata build, then discarded before the next decode.
+        local_metadata_cache_key = "cp_local_token_metadata"
+        cached_local_metadata = (
+            self.common_ratio_to_sas_metadata.get(local_metadata_cache_key) if not has_prefill else None
         )
+        if cached_local_metadata is None:
+            local_token_metadata = self._build_local_token_metadata(
+                num_reqs=num_reqs,
+                num_input_tokens=num_input_tokens,
+                input_positions=input_positions,
+                query_start_loc=query_start_loc,
+                seq_lens=self.seq_lens[:num_reqs],
+                use_cache=not has_prefill,
+                local_query_start_loc=self.local_query_start_loc,
+                local_seq_lens=self.local_seq_lens,
+            )
+            (
+                local_start,
+                local_end_with_pad,
+                tokens_per_rank,
+                num_tokens_pad,
+                local_query_start_loc,
+                local_seq_lens,
+                local_cos,
+                local_sin,
+            ) = local_token_metadata
+            _, _, _, _, local_query_start_loc_cpu, local_seq_lens_cpu, _, _ = self._build_local_token_metadata(
+                num_reqs=num_reqs,
+                num_input_tokens=num_input_tokens,
+                input_positions=None,
+                query_start_loc=query_start_loc_cpu,
+                seq_lens=self.seq_lens_cpu[:num_reqs],
+                use_cache=False,
+            )
+            local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
+            max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
+            max_local_seq_lens = max(1, int(local_seq_lens_cpu.max().item()))
+            if not has_prefill:
+                self.common_ratio_to_sas_metadata[local_metadata_cache_key] = (
+                    local_token_metadata,
+                    local_query_start_loc_cpu,
+                    local_seq_lens_cpu,
+                    max_local_query_len,
+                    max_local_seq_lens,
+                )
+        else:
+            (
+                cached_local_token_metadata,
+                local_query_start_loc_cpu,
+                local_seq_lens_cpu,
+                max_local_query_len,
+                max_local_seq_lens,
+            ) = cached_local_metadata
+            (
+                local_start,
+                local_end_with_pad,
+                tokens_per_rank,
+                num_tokens_pad,
+                cached_local_query_start_loc,
+                cached_local_seq_lens,
+                local_cos,
+                local_sin,
+            ) = cached_local_token_metadata
+            # Preserve the graph-stable addresses owned by this builder.
+            self.local_query_start_loc[: num_reqs + 1].copy_(cached_local_query_start_loc)
+            self.local_query_start_loc[num_reqs + 1 :].fill_(0)
+            self.local_seq_lens[:num_reqs].copy_(cached_local_seq_lens)
+            self.local_seq_lens[num_reqs:].fill_(0)
+            local_query_start_loc = self.local_query_start_loc[: num_reqs + 1]
+            local_seq_lens = self.local_seq_lens[:num_reqs]
+
         local_seq_lens_q = local_query_start_loc[1 : num_reqs + 1] - local_query_start_loc[:num_reqs]
-
-        _, _, _, _, local_query_start_loc_cpu, local_seq_lens_cpu, _, _ = self._build_local_token_metadata(
-            num_reqs=num_reqs,
-            num_input_tokens=num_input_tokens,
-            input_positions=None,
-            query_start_loc=query_start_loc_cpu,
-            seq_lens=self.seq_lens_cpu[:num_reqs],
-            use_cache=False,
-        )
-        local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
-        max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
-        max_local_seq_lens = max(1, int(local_seq_lens_cpu.max().item()))
 
         # start_pos: context length before current query
         start_pos = self.seq_lens[:num_reqs] - seq_lens_q
@@ -744,7 +790,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         use_cache,
         local_query_start_loc=None,
         local_seq_lens=None,
-        draft_index: int | None = None,
     ):
         """
         For example:
@@ -770,28 +815,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         tokens_per_rank = num_tokens_pad // tp_size
         local_start = tp_rank * tokens_per_rank
         local_end = local_start + tokens_per_rank
-
-        device_kind = "cpu" if input_positions is None else "device"
-        cache_key = f"cp_local_token_metadata_{device_kind}_{draft_index}"
-        cached_metadata = self.common_ratio_to_sas_metadata.get(cache_key)
-        if cached_metadata is not None:
-            cached_query_start_loc, cached_seq_lens, local_cos, local_sin = cached_metadata
-            if local_query_start_loc is not None:
-                local_query_start_loc[1 : num_reqs + 1].copy_(cached_query_start_loc[1:])
-                local_seq_lens[:num_reqs].copy_(cached_seq_lens)
-            else:
-                local_query_start_loc = cached_query_start_loc
-                local_seq_lens = cached_seq_lens
-            return (
-                local_start,
-                local_end,
-                tokens_per_rank,
-                num_tokens_pad,
-                local_query_start_loc[: num_reqs + 1],
-                local_seq_lens[:num_reqs],
-                local_cos,
-                local_sin,
-            )
 
         if local_query_start_loc is not None:
             local_query_start_loc.fill_(0)
@@ -833,7 +856,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         else:
             local_cos = None
             local_sin = None
-        result = (
+        return (
             local_start,
             local_end,
             tokens_per_rank,
@@ -843,8 +866,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             local_cos,
             local_sin,
         )
-        self.common_ratio_to_sas_metadata[cache_key] = result[4:]
-        return result
 
     def _get_cmp_seqlens_for_metadata(self, has_prefill):
         if self.compressor_ratio <= 1:
