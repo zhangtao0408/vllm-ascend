@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
@@ -182,6 +183,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.seq_lens_cpu: torch.Tensor = None
 
         self.compressor_ratio = getattr(kv_cache_spec, "compress_ratio", 0)
+        self.reuse_local_token_metadata = not bool(
+            int(os.getenv("VLLM_ASCEND_DISABLE_DSA_CP_LOCAL_METADATA_CACHE", "0"))
+        )
         hf_config = self.model_config.hf_config
 
         if AscendDSACPMetadataBuilder.hadamard is None:
@@ -623,8 +627,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # This dictionary is shared by compressor-ratio builders for one
         # metadata build, then discarded before the next decode.
         local_metadata_cache_key = "cp_local_token_metadata"
+        reuse_local_token_metadata = self.reuse_local_token_metadata and not has_prefill
         cached_local_metadata = (
-            self.common_ratio_to_sas_metadata.get(local_metadata_cache_key) if not has_prefill else None
+            self.common_ratio_to_sas_metadata.get(local_metadata_cache_key) if reuse_local_token_metadata else None
         )
         if cached_local_metadata is None:
             local_token_metadata = self._build_local_token_metadata(
@@ -658,7 +663,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
             max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
             max_local_seq_lens = max(1, int(local_seq_lens_cpu.max().item()))
-            if not has_prefill:
+            if reuse_local_token_metadata:
                 self.common_ratio_to_sas_metadata[local_metadata_cache_key] = (
                     local_token_metadata,
                     local_query_start_loc_cpu,
