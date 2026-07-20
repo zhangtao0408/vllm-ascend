@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tp_group
+from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -55,6 +56,48 @@ def _has_prefill(attn_state: AscendAttentionState) -> bool:
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
     }
+
+
+_A5C1SASSignature = tuple[tuple[int, int], ...]
+
+
+def _build_a5_c1_sas_signature(
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    num_reqs: int,
+) -> _A5C1SASSignature | None:
+    """Build the A5 c1 SAS scheduling signature from CPU metadata.
+
+    With A5, 128-token sliding-window attention and at most 16 query
+    tokens per request, each query row has one S2 block. The AICPU
+    scheduler only distinguishes whether that row has at most 64 valid
+    tokens, so ``(query_len, num_short_rows)`` fully describes one
+    request's scheduling cost while preserving request order.
+
+    Return ``None`` for inputs outside the proven cacheable domain so the
+    caller falls back to rebuilding metadata.
+    """
+    if num_reqs < 0 or query_start_loc_cpu.device.type != "cpu" or seq_lens_cpu.device.type != "cpu":
+        return None
+    if query_start_loc_cpu.numel() < num_reqs + 1 or seq_lens_cpu.numel() < num_reqs:
+        return None
+
+    query_lens = (query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]).tolist()
+    seq_lens = seq_lens_cpu[:num_reqs].tolist()
+    signature: list[tuple[int, int]] = []
+    for query_len_raw, seq_len_raw in zip(query_lens, seq_lens, strict=True):
+        query_len = int(query_len_raw)
+        seq_len = int(seq_len_raw)
+        if query_len == 0:
+            signature.append((0, 0))
+            continue
+        if query_len < 0 or query_len > 16 or seq_len < query_len:
+            return None
+
+        context_len = seq_len - query_len
+        num_short_rows = min(max(64 - context_len, 0), query_len)
+        signature.append((query_len, num_short_rows))
+    return tuple(signature)
 
 
 @dataclass
@@ -183,6 +226,17 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         self.compressor_ratio = getattr(kv_cache_spec, "compress_ratio", 0)
         hf_config = self.model_config.hf_config
+        ascend_device_type = get_ascend_device_type()
+        self._a5_c1_sas_cache_enabled = (
+            ascend_device_type == AscendDeviceType.A5
+            and self.compressor_ratio <= 1
+            and hf_config.sliding_window == 128
+            and hf_config.num_attention_heads in {64, 128}
+        )
+        self._c1_sas_cache_signature: _A5C1SASSignature | None = None
+        self._c1_sas_cache_metadata: torch.Tensor | None = None
+        self._c1_sas_cache_hits = 0
+        self._c1_sas_cache_misses = 0
 
         if AscendDSACPMetadataBuilder.hadamard is None:
             if hf_config.model_type == "deepseek_v4":
@@ -229,7 +283,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             scheduler_config.max_num_seqs,
             max_cudagraph_capture_size,
         )
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        if ascend_device_type == AscendDeviceType.A5:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens,)  # type: ignore
         else:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens, 2)  # type: ignore
@@ -285,6 +339,25 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.UNIFORM_BATCH
 
+    def _record_c1_sas_cache_lookup(self, hit: bool) -> None:
+        if hit:
+            self._c1_sas_cache_hits += 1
+        else:
+            self._c1_sas_cache_misses += 1
+
+        total = self._c1_sas_cache_hits + self._c1_sas_cache_misses
+        if total == 1 or total % 1000 == 0:
+            logger.info(
+                "DSA-CP A5 c1 SAS cache: hits=%d, misses=%d, hit_rate=%.2f%%",
+                self._c1_sas_cache_hits,
+                self._c1_sas_cache_misses,
+                self._c1_sas_cache_hits * 100.0 / total,
+            )
+
+    def get_c1_sas_cache_stats(self) -> tuple[int, int]:
+        """Return cross-round c1 SAS cache hits and misses."""
+        return self._c1_sas_cache_hits, self._c1_sas_cache_misses
+
     def build(
         self,
         common_prefix_len: int,
@@ -318,9 +391,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.common_ratio_to_sas_metadata["num_decode_tokens"] = self.num_decode_tokens
             self.common_ratio_to_sas_metadata["num_prefill_tokens"] = self.num_prefill_tokens
             input_positions = common_attn_metadata.positions[:num_input_tokens].long()
-            input_positions_cpu = common_attn_metadata.positions_cpu[:num_input_tokens].long()
             self.common_ratio_to_sas_metadata["input_positions"] = input_positions
-            self.common_ratio_to_sas_metadata["input_positions_cpu"] = input_positions_cpu
             cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=not has_prefill)
             self.common_ratio_to_sas_metadata["cos"] = cos
             self.common_ratio_to_sas_metadata["sin"] = sin
@@ -344,7 +415,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.common_ratio_to_sas_metadata["num_prefill_tokens"],
             )
             input_positions = self.common_ratio_to_sas_metadata["input_positions"]
-            input_positions_cpu = self.common_ratio_to_sas_metadata["input_positions_cpu"]
             cos, sin = self.common_ratio_to_sas_metadata["cos"], self.common_ratio_to_sas_metadata["sin"]
             self.seq_lens = self.common_ratio_to_sas_metadata["seq_lens"]
             self.seq_lens_cpu = self.common_ratio_to_sas_metadata["seq_lens_cpu"]
@@ -357,7 +427,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         req_metadata = self.build_req_metadata(
             common_attn_metadata,
             input_positions,
-            input_positions_cpu,
             cos,
             sin,
             num_input_tokens,
@@ -541,7 +610,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_seqlens_cmp_kv = (
             None if has_prefill else DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
         )
-        sas_metadata = metadata_op(
+        generated_sas_metadata = metadata_op(
             **metadata_kwargs,
             num_heads_q=num_heads,
             num_heads_kv=1,
@@ -563,8 +632,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             has_ori_kv=True,
             has_cmp_kv=False,
         )
-        self.spec_sas_metadata[draft_index - 1][:1024].copy_(sas_metadata[:1024])
         sas_metadata = self.spec_sas_metadata[draft_index - 1]
+        sas_metadata.copy_(generated_sas_metadata)
 
         cp_metadata = DSACPMetadata(
             local_query_start_loc=local_query_start_loc,
@@ -605,7 +674,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
         input_positions: torch.Tensor,
-        input_positions_cpu: torch.Tensor,
         cos,
         sin,
         num_input_tokens: int,
@@ -692,8 +760,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             local_query_start_loc = self.local_query_start_loc[: num_reqs + 1]
             local_seq_lens = self.local_seq_lens[:num_reqs]
 
-        local_seq_lens_q = local_query_start_loc[1 : num_reqs + 1] - local_query_start_loc[:num_reqs]
-
         # start_pos: context length before current query
         start_pos = self.seq_lens[:num_reqs] - seq_lens_q
 
@@ -732,7 +798,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_heads=num_heads,
             query_start_loc=local_query_start_loc,
             seq_lens=local_seq_lens,
-            seq_lens_q=local_seq_lens_q,
+            query_start_loc_cpu=local_query_start_loc_cpu,
+            seq_lens_cpu=local_seq_lens_cpu,
             max_query_len=max_local_query_len,
             max_seq_lens=max_local_seq_lens,
             index_topk=index_topk,
@@ -745,7 +812,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         qli_metadata = self._build_qli_metadata(
             query_start_loc=local_query_start_loc,
             seq_lens=local_seq_lens,
-            seq_lens_q=local_seq_lens_q,
+            max_seqlen_q=max_local_query_len,
+            max_seqlen_k=max_local_seq_lens,
             num_reqs=num_reqs,
         )
 
@@ -879,7 +947,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_heads,
         query_start_loc,
         seq_lens,
-        seq_lens_q,
+        query_start_loc_cpu,
+        seq_lens_cpu,
         max_query_len,
         max_seq_lens,
         index_topk,
@@ -891,64 +960,82 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cache_key = f"cp_sas_c{cmp_ratio}"
         metadata = self.common_ratio_to_sas_metadata.get(cache_key)
         if metadata is None:
-            cu_seqlens_ori_kv = (
-                query_start_loc
-                if has_prefill
-                else DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
-                    self.common_ratio_to_sas_metadata,
-                    f"{cache_key}_cu_seqlens_ori_kv",
-                    seq_lens,
-                    num_reqs,
-                    self._zero_i32,
-                    self.cu_seqlens_ori_kv,
-                )
+            sas_signature = (
+                _build_a5_c1_sas_signature(query_start_loc_cpu, seq_lens_cpu, num_reqs)
+                if self._a5_c1_sas_cache_enabled and not has_prefill and cmp_ratio == 1
+                else None
             )
-            cu_seqlens_cmp_kv = (
-                None if has_prefill else DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
+            sas_cache_hit = (
+                sas_signature is not None
+                and self._c1_sas_cache_metadata is not None
+                and self._c1_sas_cache_signature == sas_signature
             )
-            metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
-            metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
-            metadata_kwargs.setdefault("device", str(self.seqused_q.device))
-            kw = dict(
-                **metadata_kwargs,
-                num_heads_q=num_heads,
-                num_heads_kv=1,
-                head_dim=self.model_config.get_head_size(),
-                cu_seqlens_q=query_start_loc,
-                cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-                seqused_q=self.seqused_q,
-                seqused_kv=seq_lens,
-                max_seqlen_q=max_query_len,
-                max_seqlen_kv=max_seq_lens,
-                batch_size=num_reqs,
-                ori_mask_mode=4,
-                ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                has_ori_kv=True,
-            )
-
-            if self.compressor_ratio > 1:
-                kw["has_cmp_kv"] = True
-                if self.compressor_ratio == 4:
-                    kw["cmp_mask_mode"] = 3
-                    kw["cmp_topk"] = index_topk
-                else:
-                    kw["cmp_mask_mode"] = 3
-                kw["cmp_ratio"] = cmp_ratio
-                kw["cu_seqlens_cmp_kv"] = cu_cmp_seqlen_list
+            if sas_cache_hit:
+                metadata = self._c1_sas_cache_metadata
+                self._record_c1_sas_cache_lookup(hit=True)
             else:
-                kw["cmp_ratio"] = cmp_ratio
-                kw["has_cmp_kv"] = False
+                cu_seqlens_ori_kv = (
+                    query_start_loc
+                    if has_prefill
+                    else DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
+                        self.common_ratio_to_sas_metadata,
+                        f"{cache_key}_cu_seqlens_ori_kv",
+                        seq_lens,
+                        num_reqs,
+                        self._zero_i32,
+                        self.cu_seqlens_ori_kv,
+                    )
+                )
+                cu_seqlens_cmp_kv = (
+                    None if has_prefill else DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
+                )
+                metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
+                metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+                metadata_kwargs.setdefault("device", str(self.seqused_q.device))
+                kw = dict(
+                    **metadata_kwargs,
+                    num_heads_q=num_heads,
+                    num_heads_kv=1,
+                    head_dim=self.model_config.get_head_size(),
+                    cu_seqlens_q=query_start_loc,
+                    cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+                    cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                    seqused_q=self.seqused_q,
+                    seqused_kv=seq_lens,
+                    max_seqlen_q=max_query_len,
+                    max_seqlen_kv=max_seq_lens,
+                    batch_size=num_reqs,
+                    ori_mask_mode=4,
+                    ori_win_left=self.model_config.hf_config.sliding_window - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    has_ori_kv=True,
+                )
 
-            metadata = metadata_op(**kw)
+                if self.compressor_ratio > 1:
+                    kw["has_cmp_kv"] = True
+                    if self.compressor_ratio == 4:
+                        kw["cmp_mask_mode"] = 3
+                        kw["cmp_topk"] = index_topk
+                    else:
+                        kw["cmp_mask_mode"] = 3
+                    kw["cmp_ratio"] = cmp_ratio
+                    kw["cu_seqlens_cmp_kv"] = cu_cmp_seqlen_list
+                else:
+                    kw["cmp_ratio"] = cmp_ratio
+                    kw["has_cmp_kv"] = False
+
+                metadata = metadata_op(**kw)
+                if sas_signature is not None:
+                    self._c1_sas_cache_signature = sas_signature
+                    self._c1_sas_cache_metadata = metadata
+                    self._record_c1_sas_cache_lookup(hit=False)
         self.common_ratio_to_sas_metadata[cache_key] = metadata
-        self.req_sas_metadata[:1024] = metadata
-        return self.req_sas_metadata[:1024]
+        self.req_sas_metadata.copy_(metadata)
+        return self.req_sas_metadata
 
-    def _build_qli_metadata(self, query_start_loc, seq_lens, seq_lens_q, num_reqs):
+    def _build_qli_metadata(self, query_start_loc, seq_lens, max_seqlen_q, max_seqlen_k, num_reqs):
         if self.compressor_ratio != 4:
             return None
 
@@ -956,8 +1043,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         metadata = self.common_ratio_to_sas_metadata.get(cache_key)
 
         if metadata is None:
-            max_seqlen_q = max(1, int(seq_lens_q.max().item()))
-            max_seqlen_k = max(1, int(seq_lens.max().item()))
             metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=query_start_loc[1:].clone(),
                 actual_seq_lengths_key=seq_lens.clone(),
@@ -979,8 +1064,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 device=str(self.seqused_q.device),
             )
         self.common_ratio_to_sas_metadata[cache_key] = metadata
-        self.req_qli_metadata[:1024] = metadata
-        return self.req_qli_metadata[:1024]
+        self.req_qli_metadata.copy_(metadata)
+        return self.req_qli_metadata
 
     def build_for_graph_capture(
         self,

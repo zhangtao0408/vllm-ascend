@@ -1456,18 +1456,8 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     def get_dsa_decode_cu_seqlens_ori_kv(
         decode_ratio_to_sas_metadata, cache_key, seq_lens, num_decodes, zero_i32, fallback_cu_seqlens
     ):
-        """A5: compute from cumsum of seq_lens, with caching."""
-        if decode_ratio_to_sas_metadata is not None and cache_key in decode_ratio_to_sas_metadata:
-            return decode_ratio_to_sas_metadata[cache_key]
-        cu_seqlens = torch.cat(
-            [
-                zero_i32,
-                torch.cumsum(seq_lens[:num_decodes], dim=0).to(torch.int32),
-            ]
-        )
-        if decode_ratio_to_sas_metadata is not None:
-            decode_ratio_to_sas_metadata[cache_key] = cu_seqlens
-        return cu_seqlens
+        """A5: seqused_kv supplies KV lengths, so cumulative lengths are unused."""
+        return None
 
     @staticmethod
     def get_dsa_kernel_block_sizes():
