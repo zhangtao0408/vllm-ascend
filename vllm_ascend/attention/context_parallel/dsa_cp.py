@@ -554,6 +554,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         seq_lens_q = query_start_loc[1:] - query_start_loc[:-1]
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
 
+        # ACL graph replay keeps the nested local RoPE addresses captured for
+        # this draft step, so refresh the draft-owned buffers instead of
+        # returning temporary gather results.
         (
             local_start,
             local_end_with_pad,
@@ -569,7 +572,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             input_positions=input_positions,
             query_start_loc=query_start_loc,
             seq_lens=self.seq_lens[:num_reqs],
-            use_cache=False,
+            use_cache=True,
+            draft_index=draft_index,
             local_query_start_loc=self.spec_local_query_start_loc[draft_index - 1],
             local_seq_lens=self.spec_local_seq_lens[draft_index - 1],
         )
@@ -858,6 +862,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         use_cache,
         local_query_start_loc=None,
         local_seq_lens=None,
+        draft_index=None,
     ):
         """
         For example:
@@ -918,7 +923,11 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             pad_tokens = num_tokens_pad - input_positions.shape[0]
             if pad_tokens > 0:
                 input_positions = F.pad(input_positions, (0, pad_tokens), value=0)
-            local_cos, local_sin = get_cos_and_sin_dsa(input_positions, use_cache=use_cache)
+            local_cos, local_sin = get_cos_and_sin_dsa(
+                input_positions,
+                use_cache=use_cache,
+                draft_index=draft_index,
+            )
             local_cos = local_cos[local_start:local_end]
             local_sin = local_sin[local_start:local_end]
         else:
